@@ -79,6 +79,50 @@ def _sample_bundle(symbol: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# News: Google News RSS (real, current headlines) with a yfinance fallback
+# --------------------------------------------------------------------------- #
+def _google_news(query: str, n: int = 6) -> list:
+    """Recent headlines from Google News RSS — far fresher and more relevant than
+    yfinance's news feed. Returns [] on any failure so the caller can fall back."""
+    try:
+        import xml.etree.ElementTree as ET
+        from urllib.parse import quote as _q
+        try:
+            from curl_cffi import requests as _creq
+            r = _creq.get(f"https://news.google.com/rss/search?q={_q(query)}&hl=en-IN&gl=IN&ceid=IN:en",
+                          impersonate="chrome", timeout=8)
+            text = r.text
+        except Exception:
+            import urllib.request
+            req = urllib.request.Request(
+                f"https://news.google.com/rss/search?q={_q(query)}&hl=en-IN&gl=IN&ceid=IN:en",
+                headers={"User-Agent": "Mozilla/5.0"})
+            text = urllib.request.urlopen(req, timeout=8).read().decode("utf-8", "ignore")
+        root = ET.fromstring(text)
+        out = []
+        for it in root.findall(".//item")[:n]:
+            title = (it.findtext("title") or "").strip()
+            if title:
+                out.append({"headline": title, "sentiment": "n/a"})
+        return out
+    except Exception:
+        return []
+
+
+def _yf_news(tk, n: int = 6) -> list:
+    out = []
+    try:
+        for nws in (tk.news or [])[:n]:
+            c = nws.get("content", nws)
+            h = c.get("title") or nws.get("title", "")
+            if h:
+                out.append({"headline": h, "sentiment": "n/a"})
+    except Exception:
+        pass
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Live bundle from yfinance
 # --------------------------------------------------------------------------- #
 def _live_bundle(symbol: str) -> dict:
@@ -99,30 +143,67 @@ def _live_bundle(symbol: str) -> dict:
         raise ValueError("not enough closes")
     change = round((closes[-1] / closes[0] - 1) * 100, 2)
 
+    price = closes[-1]
+
+    # fast_info: lightweight + reliable shares and market cap (no .info dependency).
+    fi_shares = fi_mktcap = None
+    try:
+        fi = tk.fast_info
+        fi_shares = _num(getattr(fi, "shares", None))
+        fi_mktcap = _num(getattr(fi, "market_cap", None))
+    except Exception:
+        pass
+
+    # .info is SUPPLEMENTARY only — it is often empty/throttled for NSE names, which
+    # was the bug behind "Valuation: {}". We never depend on it for core ratios.
     info = {}
     try:
         info = tk.info or {}
     except Exception:
         pass
-    def _pct(v):  # yfinance gives margins/ROE as fractions (0.247); show as % (24.7)
-        return round(v * 100, 2) if isinstance(v, (int, float)) else None
+    def _pct(v):
+        return round(v * 100, 2) if isinstance(v, (int, float)) and v == v else None
 
-    mc = info.get("marketCap")
-    fundamentals = {"pe": info.get("trailingPE"), "pb": info.get("priceToBook"),
-                    "market_cap": mc, "market_cap_cr": round(mc / 1e7) if mc else None,
-                    "net_margin_pct": _pct(info.get("profitMargins")),
-                    "roe_pct": _pct(info.get("returnOnEquity")),
-                    "dividend_yield_pct": info.get("dividendYield"),
-                    "debt_to_equity": info.get("debtToEquity")}
+    # Financial statements: the reliable backbone for fundamentals.
+    qresults = _quarterly_from(tk)
+    bsheet = _balance_sheet_from(tk)
 
-    news = []
-    try:
-        for n in (tk.news or [])[:6]:
-            c = n.get("content", n)
-            news.append({"headline": c.get("title") or n.get("title", ""), "sentiment": "n/a"})
-    except Exception:
-        pass
+    def _sum4(key):
+        vals = [q[key] for q in qresults[:4] if q.get(key) is not None]
+        return sum(vals) if len(vals) >= 4 else None
+    ttm_ni_cr = _sum4("net_income_cr")
+    ttm_rev_cr = _sum4("revenue_cr")
+    ttm_op_cr = _sum4("operating_income_cr")
+    equity_cr = bsheet.get("shareholders_equity_cr")
+    debt_cr = bsheet.get("total_debt_cr")
 
+    mc = fi_mktcap or _num(info.get("marketCap")) or (fi_shares * price if fi_shares else None)
+    mc_cr = round(mc / 1e7) if mc else None
+
+    # Derive ratios from primary data (market cap, trailing profit, equity); fall back
+    # to .info only when a component is missing.
+    pe = (round(mc_cr / ttm_ni_cr, 2) if (mc_cr and ttm_ni_cr and ttm_ni_cr > 0)
+          else _num(info.get("trailingPE")))
+    pb = (round(mc_cr / equity_cr, 2) if (mc_cr and equity_cr and equity_cr > 0)
+          else _num(info.get("priceToBook")))
+    roe = (round(ttm_ni_cr / equity_cr * 100, 2) if (ttm_ni_cr and equity_cr and equity_cr > 0)
+           else _pct(info.get("returnOnEquity")))
+    net_margin = (round(ttm_ni_cr / ttm_rev_cr * 100, 2) if (ttm_ni_cr and ttm_rev_cr and ttm_rev_cr > 0)
+                  else _pct(info.get("profitMargins")))
+    if debt_cr is not None and equity_cr:
+        d2e = round(debt_cr / equity_cr, 2)
+    elif isinstance(info.get("debtToEquity"), (int, float)):
+        d2e = round(info["debtToEquity"] / 100, 2)        # yfinance reports it ×100
+    else:
+        d2e = None
+    eps_ttm = round(ttm_ni_cr * 1e7 / fi_shares, 2) if (ttm_ni_cr and fi_shares) else None
+
+    fundamentals = {"pe": pe, "pb": pb, "market_cap": mc, "market_cap_cr": mc_cr,
+                    "net_margin_pct": net_margin, "roe_pct": roe,
+                    "dividend_yield_pct": None, "debt_to_equity": d2e,
+                    "eps_ttm": eps_ttm, "revenue_ttm_cr": ttm_rev_cr}
+
+    # Splits & dividends
     splits, dividends, dvs = [], [], None
     try:
         splits = [{"date": str(i.date()), "ratio": float(r)} for i, r in tk.splits.items()][-8:]
@@ -133,16 +214,6 @@ def _live_bundle(symbol: str) -> dict:
         dividends = [{"year": i.year, "amount": round(float(v), 2)} for i, v in dvs.items()][-6:]
     except Exception:
         pass
-
-    # Yahoo's derived ratios for NSE names are often stale/inconsistent, so derive
-    # PE and dividend yield from primary data instead — price ÷ trailing EPS, and
-    # the actual trailing-12-month dividends ÷ price. This also keeps them consistent
-    # with the price and quarterly EPS we display (PE = price / EPS the user can see).
-    price = closes[-1]
-    ttm_eps = _ttm_eps(tk)
-    if ttm_eps and ttm_eps > 0:
-        fundamentals["pe"] = round(price / ttm_eps, 2)
-        fundamentals["eps_ttm"] = round(ttm_eps, 2)
     try:
         import pandas as pd
         if dvs is not None and not dvs.empty:
@@ -152,27 +223,54 @@ def _live_bundle(symbol: str) -> dict:
                 fundamentals["dividend_yield_pct"] = round(ttm_div / price * 100, 2)
     except Exception:
         pass
+    if fundamentals["dividend_yield_pct"] is None and isinstance(info.get("dividendYield"), (int, float)):
+        fundamentals["dividend_yield_pct"] = info["dividendYield"]
+    fundamentals = {k: v for k, v in fundamentals.items() if v is not None}
+
+    # Extended stats — compute what we can so it isn't empty when .info is throttled.
+    ma50 = round(sum(closes[-50:]) / min(50, len(closes)), 2) if len(closes) >= 20 else None
+    def _yoy(key):
+        if len(qresults) >= 4 and qresults[0].get(key) and qresults[3].get(key):
+            try:
+                return round((qresults[0][key] / qresults[3][key] - 1) * 100, 2)
+            except Exception:
+                return None
+        return None
+    rg, eg = _yoy("revenue_cr"), _yoy("net_income_cr")
+    op_margin = (round(ttm_op_cr / ttm_rev_cr * 100, 2) if (ttm_op_cr and ttm_rev_cr and ttm_rev_cr > 0)
+                 else _pct(info.get("operatingMargins")))
+    stats = {"beta": info.get("beta"), "ma50": ma50, "ma200": info.get("twoHundredDayAverage"),
+             "revenue_growth_pct": rg if rg is not None else _pct(info.get("revenueGrowth")),
+             "earnings_growth_pct": eg if eg is not None else _pct(info.get("earningsGrowth")),
+             "operating_margin_pct": op_margin, "gross_margin_pct": _pct(info.get("grossMargins")),
+             "current_ratio": info.get("currentRatio")}
+    stats = {k: v for k, v in stats.items() if v is not None}
 
     analyst = {"target_mean": info.get("targetMeanPrice"), "target_high": info.get("targetHighPrice"),
                "target_low": info.get("targetLowPrice"), "recommendation": info.get("recommendationKey"),
-               "num_analysts": info.get("numberOfAnalystOpinions"), "current_price": closes[-1]}
+               "num_analysts": info.get("numberOfAnalystOpinions"), "current_price": price}
     analyst = {k: v for k, v in analyst.items() if v is not None}
-    stats = {"beta": info.get("beta"), "ma50": info.get("fiftyDayAverage"),
-             "ma200": info.get("twoHundredDayAverage"), "revenue_growth_pct": _pct(info.get("revenueGrowth")),
-             "earnings_growth_pct": _pct(info.get("earningsGrowth")), "gross_margin_pct": _pct(info.get("grossMargins")),
-             "operating_margin_pct": _pct(info.get("operatingMargins")), "current_ratio": info.get("currentRatio")}
-    stats = {k: v for k, v in stats.items() if v is not None}
+
+    try:
+        avg_volume_m = round(float(hist["Volume"].tail(20).mean()) / 1e6, 2)
+    except Exception:
+        avg_volume_m = round((info.get("averageVolume") or 0) / 1e6, 2)
+
+    # News: Google News RSS first (current + relevant), yfinance as a fallback.
+    name = info.get("shortName") or _base(symbol)
+    news = _google_news(f"{name} share price NSE") or _yf_news(tk)
 
     return {
-        "ticker": _base(symbol), "name": info.get("shortName") or _base(symbol), "source": "live",
-        "quote": {"price": closes[-1], "change_pct": change},
-        "price": {"period": "6mo", "start": closes[0], "end": closes[-1],
+        "ticker": _base(symbol), "name": name, "source": "live",
+        "quote": {"price": price, "change_pct": change},
+        "price": {"period": "6mo", "start": closes[0], "end": price,
                   "high": max(closes), "low": min(closes), "change_pct": change,
-                  "avg_volume_m": round((info.get("averageVolume") or 0) / 1e6, 2)},
+                  "avg_volume_m": avg_volume_m},
         "week52": {"high": info.get("fiftyTwoWeekHigh"), "low": info.get("fiftyTwoWeekLow")},
         "fundamentals": fundamentals, "news": news,
         "splits": splits, "dividends": dividends, "chart": chart,
         "analyst": analyst, "stats": stats,
+        "quarterly_results": qresults, "balance_sheet": bsheet,
     }
 
 
@@ -356,31 +454,10 @@ def _inr_scale(tk, sample) -> float:
     return 1.0
 
 
-def _ttm_eps(tk):
-    """Trailing-12-month Basic EPS from the last 4 quarters (INR-normalised). Returns
-    None unless a full year of quarters is available, so PE never uses a partial TTM."""
+def _quarterly_from(tk):
+    """Quarterly results (₹ crore + EPS), INR-normalised. Works off the income
+    statement, which is far more reliable than the .info endpoint."""
     try:
-        q = tk.quarterly_income_stmt
-        if q is None or q.empty or "Basic EPS" not in q.index:
-            return None
-        rev0 = q.at["Total Revenue", q.columns[0]] if "Total Revenue" in q.index else None
-        scale = _inr_scale(tk, rev0)
-        vals = []
-        for c in list(q.columns)[:4]:
-            v = q.at["Basic EPS", c]
-            if v is not None and v == v:
-                vals.append(float(v) * scale)
-        return sum(vals) if len(vals) >= 4 else None
-    except Exception:
-        return None
-
-
-def quarterly(s):
-    """Recent quarterly revenue, net profit, operating income (₹ crore) and EPS
-    (live-only, best-effort). Values are normalised to INR so peer comparisons are
-    apples-to-apples even when yfinance reports a peer in USD."""
-    try:
-        tk = _ticker(s)
         q = tk.quarterly_income_stmt
         if q is None or q.empty:
             return []
@@ -401,12 +478,17 @@ def quarterly(s):
         return []
 
 
-def balance_sheet(s):
-    """Key balance-sheet items in ₹ crore: shareholders' equity, total assets &
-    liabilities, debt, cash, retained earnings, working capital, plus book value
-    per share (live-only, best-effort)."""
+def quarterly(s):
+    """Recent quarterly revenue, net profit, operating income (₹ crore) and EPS
+    (INR-normalised so peer comparisons are apples-to-apples even when yfinance
+    reports a peer in USD)."""
+    return _quarterly_from(_ticker(s))
+
+
+def _balance_sheet_from(tk):
+    """Key balance-sheet items in ₹ crore (INR-normalised). Works off the balance
+    sheet statement, independent of the flaky .info endpoint."""
     try:
-        tk = _ticker(s)
         bs = tk.quarterly_balance_sheet
         if bs is None or bs.empty:
             bs = tk.balance_sheet
@@ -442,6 +524,12 @@ def balance_sheet(s):
         return {k: v for k, v in out.items() if v is not None}
     except Exception:
         return {}
+
+
+def balance_sheet(s):
+    """Key balance-sheet items in ₹ crore: shareholders' equity, total assets &
+    liabilities, debt, cash, retained earnings, working capital, book value/share."""
+    return _balance_sheet_from(_ticker(s))
 
 
 def performance(s):

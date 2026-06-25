@@ -146,6 +146,59 @@ def _chart_payload(b: dict) -> dict:
             "change_pct": b["price"]["change_pct"], "source": b.get("source", "sample")}
 
 
+# --- readable formatting: turn metric dicts / quarter lists into markdown tables ---
+_LABELS = {
+    "pe": "P/E", "pb": "P/B", "market_cap_cr": "Market cap", "market_cap": "Market cap",
+    "roe_pct": "ROE", "net_margin_pct": "Net margin", "operating_margin_pct": "Operating margin",
+    "gross_margin_pct": "Gross margin", "debt_to_equity": "Debt / equity",
+    "dividend_yield_pct": "Dividend yield", "eps_ttm": "EPS (TTM)", "revenue_ttm_cr": "Revenue (TTM)",
+    "shareholders_equity_cr": "Shareholders' equity", "total_assets_cr": "Total assets",
+    "total_liabilities_cr": "Total liabilities", "total_debt_cr": "Total debt", "cash_cr": "Cash",
+    "retained_earnings_cr": "Retained earnings", "working_capital_cr": "Working capital",
+    "book_value_per_share": "Book value / share", "as_of": "As of", "beta": "Beta",
+    "ma50": "50-day avg", "ma200": "200-day avg", "revenue_growth_pct": "Revenue growth (YoY)",
+    "earnings_growth_pct": "Earnings growth (YoY)", "current_ratio": "Current ratio",
+    "high": "High", "low": "Low", "period_change_pct": "Period change", "last_close": "Last close",
+}
+
+
+def _fmt_val(k, v):
+    if not isinstance(v, (int, float)):
+        return str(v)
+    if k.endswith("_cr"):
+        return f"₹{v:,.0f} cr"
+    if k == "market_cap":
+        return f"₹{v:,.0f}"
+    if k.endswith("_pct"):
+        return f"{v:,.2f}%"
+    if k in ("ma50", "ma200", "eps_ttm", "book_value_per_share", "last_close", "high", "low"):
+        return f"₹{v:,.2f}"
+    return f"{v:,.2f}".rstrip("0").rstrip(".")
+
+
+def _md_metrics(d: dict) -> str:
+    if not d:
+        return "_No data available._"
+    rows = "\n".join(f"| {_LABELS.get(k, k.replace('_', ' '))} | {_fmt_val(k, v)} |" for k, v in d.items())
+    return f"| Metric | Value |\n|---|---|\n{rows}"
+
+
+def _c(v):
+    return f"{v:,.0f}" if isinstance(v, (int, float)) else "—"
+
+
+def _md_quarters(rows: list) -> str:
+    if not rows:
+        return "_No quarterly data available._"
+    head = ("| Quarter | Revenue (₹ cr) | Net profit (₹ cr) | Op. income (₹ cr) | EPS (₹) |\n"
+            "|---|--:|--:|--:|--:|")
+    body = "\n".join(
+        f"| {r.get('quarter','')} | {_c(r.get('revenue_cr'))} | {_c(r.get('net_income_cr'))} "
+        f"| {_c(r.get('operating_income_cr'))} | {r.get('eps') if r.get('eps') is not None else '—'} |"
+        for r in rows)
+    return head + "\n" + body
+
+
 def _execute(tool: str, ticker: str):
     """Returns (result_text, chart_payload_or_None). Never invents data."""
     try:
@@ -247,25 +300,25 @@ def _execute(tool: str, ticker: str):
             a = market.analyst_ratings(ticker)
             if not a:
                 return "Analyst price targets / consensus aren't available for this stock (live-only data).", None
-            return "Analyst consensus: " + json.dumps(a, default=str), None
+            return "**Analyst consensus**\n\n" + _md_metrics(a), None
 
         if tool == "quarterly_results":
             q = market.quarterly(ticker)
             if not q:
                 return "Quarterly results aren't available for this stock (live-only data).", None
-            return "Recent quarters (₹ crore): " + json.dumps(q, default=str), None
+            return "**Recent quarterly results**\n\n" + _md_quarters(q), None
 
         if tool == "balance_sheet":
             bs = market.balance_sheet(ticker)
             if not bs:
                 return "Balance-sheet data isn't available for this stock (live-only data).", None
-            return "Balance sheet (₹ crore): " + json.dumps(bs, default=str), None
+            return "**Balance sheet**\n\n" + _md_metrics(bs), None
 
         if tool == "key_stats":
             s = market.stats(ticker)
             if not s:
                 return "Extended stats (beta, moving averages, growth) aren't available for this stock (live-only data).", None
-            return "Key stats: " + json.dumps(s, default=str), None
+            return "**Key stats**\n\n" + _md_metrics(s), None
 
         if tool == "news_sentiment":
             items = market.news(ticker)
@@ -285,20 +338,24 @@ def _execute(tool: str, ticker: str):
 
         if tool == "fundamentals":
             f = market.fundamentals(ticker)
-            return "Fundamentals: " + json.dumps(f, default=str), None
+            return ("**Fundamentals**\n\n" + _md_metrics(f)) if f else "Fundamentals aren't available for this stock.", None
 
         if tool == "valuation":
-            return "Valuation: " + json.dumps(market.valuation(ticker), default=str), None
+            v = market.valuation(ticker)
+            return ("**Valuation**\n\n" + _md_metrics(v)) if v else "Valuation metrics aren't available for this stock.", None
 
         if tool == "performance":
-            return "Performance: " + json.dumps(market.performance(ticker), default=str), None
+            return "**Performance**\n\n" + _md_metrics(market.performance(ticker)), None
 
         if tool == "fifty_two_week":
-            return "52-week range: " + json.dumps(market.week52(ticker), default=str), None
+            return "**52-week range**\n\n" + _md_metrics(market.week52(ticker)), None
 
         if tool == "dividends":
             d = market.dividends(ticker)
-            return ("Dividend history: " + json.dumps(d, default=str)) if d else "No dividend history on record.", None
+            if not d:
+                return "No dividend history on record.", None
+            body = "\n".join(f"| {x.get('year','')} | ₹{x.get('amount')} |" for x in d)
+            return "**Dividend history**\n\n| Year | Dividend / share |\n|---|--:|\n" + body, None
 
         if tool == "price_trend":
             b = market.bundle(ticker)
@@ -311,7 +368,10 @@ def _execute(tool: str, ticker: str):
 
         if tool == "stock_splits":
             s = market.splits(ticker)
-            return ("Stock splits: " + json.dumps(s, default=str)) if s else "No stock splits on record.", None
+            if not s:
+                return "No stock splits on record.", None
+            body = "\n".join(f"| {x.get('date','')} | {x.get('ratio')}:1 |" for x in s)
+            return "**Stock splits**\n\n| Date | Ratio |\n|---|---|\n" + body, None
 
     except Exception as e:
         return f"Could not fetch live data for this step ({e}). Continuing with what we have.", None

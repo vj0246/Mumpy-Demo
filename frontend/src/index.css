@@ -146,8 +146,8 @@ h1 { font-weight: 700; font-size: 30px; letter-spacing: -0.02em; color: var(--in
 .md a { color: var(--brand); text-decoration: underline; }
 .md blockquote { border-left: 3px solid var(--line); margin: 8px 0; padding-left: 10px; color: var(--sub); }
 .md hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
-.md table { border-collapse: collapse; margin: 8px 0; font-size: 12px; display: block; overflow-x: auto; max-width: 100%; }
-.md th, .md td { border: 1px solid var(--line); padding: 6px 9px; text-align: right; white-space: nowrap; }
+.md table { border-collapse: collapse; margin: 8px 0; font-size: 12px; width: 100%; }
+.md th, .md td { border: 1px solid var(--line); padding: 6px 9px; text-align: right; vertical-align: top; overflow-wrap: anywhere; }
 .md th:first-child, .md td:first-child { text-align: left; }
 .md thead th { background: var(--brand-soft); font-weight: 700; color: var(--brand-deep); }
 .md tbody tr:nth-child(even) { background: var(--surface); }
