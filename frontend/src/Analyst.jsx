@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import Chart from "./Chart.jsx";
-
-const API = "http://localhost:8000";
+import TickerSearch from "./TickerSearch.jsx";
+import { API } from "./api.js";
 
 const PRESETS = [
   ["Fundamental analysis", "Do a fundamental analysis: financial health, valuation and quality verdict."],
@@ -80,7 +80,7 @@ export default function Analyst() {
       <div className="task-setup">
         <div className="row1">
           <span className="nse">NSE</span>
-          <input className="ticker-input" value={ticker} onChange={(e) => setTicker(e.target.value.toUpperCase())} placeholder="Stock symbol, e.g. RELIANCE" spellCheck={false} disabled={running} />
+          <TickerSearch value={ticker} onChange={setTicker} disabled={running} placeholder="Search company or symbol, e.g. RELIANCE" />
         </div>
         <div className="presets">
           {PRESETS.map(([label, t]) => (

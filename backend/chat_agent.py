@@ -19,6 +19,13 @@ from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 
 import market
+import docstore
+
+# The active chat thread for the in-flight request. The document Q&A tool reads
+# this to find the right uploaded document (a tool only receives the LLM's args,
+# not the thread). The demo serves one chat stream at a time, so a module-level
+# holder is sufficient; set at the top of run_chat().
+_ACTIVE = {"thread": None}
 
 # Groq-hosted model. Upgraded from llama-3.3-70b to the 120B gpt-oss for stronger
 # reasoning and tool selection — still uses your existing GROQ_API_KEY (free/fast),
@@ -44,7 +51,9 @@ def _interpret(instruction: str, data) -> str:
 # --------------------------------------------------------------------------- #
 @tool
 def get_quote(ticker: str) -> str:
-    """Latest price and day/period change for an NSE stock."""
+    """Latest LIVE price for an NSE stock: real-time/intraday spot price, today's %
+    move vs the previous close, and the market state (REGULAR=open / CLOSED / PRE /
+    POST) with an as_of timestamp. Use this for 'current price' / 'price right now'."""
     return json.dumps(market.quote(ticker), default=str)
 
 
@@ -113,6 +122,30 @@ def get_52week_range(ticker: str) -> str:
 def get_performance(ticker: str) -> str:
     """Recent performance summary: period change %, high and low."""
     return json.dumps(market.performance(ticker), default=str)
+
+
+@tool
+def ask_document(question: str) -> str:
+    """Answer a question using the user's UPLOADED document (e.g. an annual report,
+    financial statement or any PDF/Word file they attached to this chat). Use this
+    whenever the user refers to 'the document', 'the uploaded file', 'the report',
+    'the financial statement', 'the PDF', or asks something that should come from
+    their file rather than market data. Pass the user's full question."""
+    thread = _ACTIVE.get("thread")
+    if not thread or not docstore.has_document(thread):
+        return "No document has been uploaded to this chat yet. Ask the user to upload a PDF or Word file first."
+    context = docstore.retrieve(thread, question, k=6)
+    if not context.strip():
+        return "The uploaded document doesn't appear to contain anything relevant to that question."
+    name = docstore.doc_name(thread)
+    answer = _llm.invoke([HumanMessage(content=(
+        "You are answering strictly from the user's uploaded document"
+        f" ('{name}'). Use ONLY the excerpts below — never invent figures, dates or "
+        "facts. If the answer isn't in the excerpts, say it isn't in the document. "
+        "Quote the relevant numbers. If money is shown in rupees, keep ₹.\n\n"
+        f"DOCUMENT EXCERPTS:\n{context}\n\nQUESTION: {question}"
+    ))]).content
+    return answer or "I couldn't extract an answer from the document for that question."
 
 
 @tool
@@ -214,7 +247,8 @@ def get_key_stats(ticker: str) -> str:
 TOOLS = [get_quote, get_price_chart, get_fundamentals, get_valuation, get_fundamental_analysis,
          get_technical_analysis, explain_price_move, get_risk_assessment, get_bull_bear_case,
          analyze_news_sentiment, get_news_headlines, get_splits, get_dividends, get_52week_range,
-         get_performance, get_analyst_ratings, get_quarterly_results, get_key_stats, deep_desk_analysis]
+         get_performance, get_analyst_ratings, get_quarterly_results, get_key_stats,
+         ask_document, deep_desk_analysis]
 
 SYSTEM = SystemMessage(content=(
     "You are a careful equity research assistant for Indian (NSE) stocks. "
@@ -234,8 +268,13 @@ def _short(t, n=220):
 
 
 async def run_chat(ticker: str, question: str, thread_id: str):
+    _ACTIVE["thread"] = thread_id           # so ask_document finds this chat's upload
     history = _history.get(thread_id, [])
-    user_msg = HumanMessage(content=f"[Stock in focus: {ticker.upper()} (NSE)]\n{question}")
+    doc_note = ""
+    if docstore.has_document(thread_id):
+        doc_note = (f"\n[A document is attached to this chat: '{docstore.doc_name(thread_id)}'. "
+                    "If the question is about its contents, use the ask_document tool.]")
+    user_msg = HumanMessage(content=f"[Stock in focus: {ticker.upper()} (NSE)]{doc_note}\n{question}")
     messages = history + [user_msg]
     final_answer = ""
     try:

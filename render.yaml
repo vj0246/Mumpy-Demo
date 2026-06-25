@@ -1,0 +1,24 @@
+# Render Blueprint — deploys the FastAPI backend as one always-on web service.
+# Use it: Render Dashboard -> New -> Blueprint -> pick the Mumpy-Demo repo.
+# It reads this file, creates the service, and asks you to paste GROQ_API_KEY.
+#
+# (The React frontend is deployed separately on Vercel — see DEPLOY.md.)
+services:
+  - type: web
+    name: mumpy-demo-api
+    runtime: python
+    rootDir: backend                 # the FastAPI app lives in backend/
+    plan: free                       # free tier sleeps after ~15 min idle
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app_multi:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true                 # redeploy on every push to main
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: GROQ_API_KEY            # paste your gsk_... key in the Render UI
+        sync: false                  # not stored in git
+      # LangSmith tracing is optional; off by default so no extra key is needed.
+      - key: LANGCHAIN_TRACING_V2
+        value: "false"

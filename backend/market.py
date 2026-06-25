@@ -12,6 +12,11 @@ from seed_data import SEEDS
 
 _CACHE: dict = {}
 _TTL = 300
+# The full bundle (chart, fundamentals, news) is fine cached for 5 min, but the
+# live PRICE must refresh far more often or it shows yesterday's close while the
+# market is open. So the spot quote gets its own short-lived cache.
+_QUOTE_CACHE: dict = {}
+_QUOTE_TTL = 20
 _SEED = set(SEEDS)
 
 
@@ -22,6 +27,38 @@ def _nse(symbol: str) -> str:
 
 def _base(symbol: str) -> str:
     return symbol.strip().upper().replace(".NS", "").replace(".BO", "")
+
+
+def _ticker(symbol: str):
+    """A yfinance Ticker on a browser-impersonating session when available.
+
+    curl_cffi makes us look like a real Chrome client, which sharply reduces
+    Yahoo's rate-limiting (the empty-body "possibly delisted" responses). If
+    curl_cffi isn't installed we silently fall back to yfinance's default.
+    """
+    import yfinance as yf
+    try:
+        from curl_cffi import requests as _creq
+        return yf.Ticker(_nse(symbol), session=_creq.Session(impersonate="chrome"))
+    except Exception:
+        return yf.Ticker(_nse(symbol))
+
+
+def _history(tk, **kw):
+    """tk.history with a few retries — Yahoo throttling is usually transient, so a
+    short backoff turns most "no data" misfires into a real result."""
+    last_exc = None
+    for attempt in range(3):
+        try:
+            h = tk.history(**kw)
+            if h is not None and not h.empty:
+                return h
+        except Exception as e:
+            last_exc = e
+        time.sleep(0.5 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+    raise ValueError("no history")
 
 
 # --------------------------------------------------------------------------- #
@@ -45,10 +82,8 @@ def _sample_bundle(symbol: str) -> dict:
 # Live bundle from yfinance
 # --------------------------------------------------------------------------- #
 def _live_bundle(symbol: str) -> dict:
-    import yfinance as yf
-    sym = _nse(symbol)
-    tk = yf.Ticker(sym)
-    hist = tk.history(period="6mo")
+    tk = _ticker(symbol)
+    hist = _history(tk, period="6mo")
     if hist.empty:
         raise ValueError("no history")
     # yfinance often returns holiday / partial / not-yet-settled rows whose Close is
@@ -123,6 +158,86 @@ def _live_bundle(symbol: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Live spot quote (the real-time price, refreshed every ~20s)
+# --------------------------------------------------------------------------- #
+def _num(v):
+    """Return v as a float only if it's a real, finite number (NaN != NaN)."""
+    return float(v) if isinstance(v, (int, float)) and v == v else None
+
+
+def _live_quote(symbol: str) -> dict:
+    """The current/intraday price — NOT the last daily close.
+
+    yfinance's `history()` only returns settled daily bars, so during market
+    hours `closes[-1]` is yesterday's (or this morning's) close. We instead read
+    the live price from, in order of freshness: fast_info -> a 1-minute intraday
+    bar -> .info. Day change is measured against the *previous close*, which is
+    what an investor means by "today's move".
+    """
+    tk = _ticker(symbol)
+
+    price = prev = day_high = day_low = state = None
+
+    # 1) fast_info: the lightest, freshest endpoint (no full .info download).
+    try:
+        fi = tk.fast_info
+        price = _num(getattr(fi, "last_price", None))
+        prev = _num(getattr(fi, "previous_close", None))
+        day_high = _num(getattr(fi, "day_high", None))
+        day_low = _num(getattr(fi, "day_low", None))
+    except Exception:
+        pass
+
+    # 2) A 1-minute intraday bar pins down the live price if fast_info missed it.
+    if price is None:
+        try:
+            intr = tk.history(period="1d", interval="1m")
+            intr = intr.dropna(subset=["Close"])
+            if not intr.empty:
+                price = _num(intr["Close"].iloc[-1])
+                day_high = day_high or _num(intr["High"].max())
+                day_low = day_low or _num(intr["Low"].min())
+        except Exception:
+            pass
+
+    # 3) .info as a last resort (and for the market_state flag).
+    if price is None or prev is None or state is None:
+        info = {}
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        price = price or _num(info.get("currentPrice")) or _num(info.get("regularMarketPrice"))
+        prev = prev or _num(info.get("regularMarketPreviousClose")) or _num(info.get("previousClose"))
+        state = info.get("marketState")
+
+    if price is None:
+        raise ValueError("no live price")
+
+    change_pct = round((price / prev - 1) * 100, 2) if prev else None
+    return {
+        "price": round(price, 2),
+        "change_pct": change_pct,
+        "prev_close": round(prev, 2) if prev else None,
+        "day_high": round(day_high, 2) if day_high else None,
+        "day_low": round(day_low, 2) if day_low else None,
+        "market_state": state,        # REGULAR (open) / CLOSED / PRE / POST / None
+        "as_of": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "live",
+    }
+
+
+def _cached_live_quote(symbol: str) -> dict:
+    key = _base(symbol)
+    now = time.time()
+    if key in _QUOTE_CACHE and now - _QUOTE_CACHE[key][0] < _QUOTE_TTL:
+        return _QUOTE_CACHE[key][1]
+    q = _live_quote(symbol)
+    _QUOTE_CACHE[key] = (now, q)
+    return q
+
+
+# --------------------------------------------------------------------------- #
 # Public: cached bundle (live first, sample fallback)
 # --------------------------------------------------------------------------- #
 def bundle(symbol: str) -> dict:
@@ -132,20 +247,35 @@ def bundle(symbol: str) -> dict:
         return _CACHE[key][1]
     try:
         b = _live_bundle(symbol)
-    except Exception:
+    except Exception as e:
         if key in _SEED:
             b = _sample_bundle(symbol)
         else:
+            # The live fetch failed for a ticker we have no sample for. This is
+            # almost always Yahoo throttling (transient), NOT a bad symbol — say so
+            # rather than implying the stock doesn't exist.
             raise ValueError(
-                f"No data for '{symbol}'. Live feed unavailable and no sample on file. "
-                f"Try one of: {', '.join(sorted(_SEED))}."
+                f"Couldn't fetch live data for '{_base(symbol)}' right now "
+                f"(the market feed is rate-limiting or temporarily unreachable: {e}). "
+                f"Wait a few seconds and try again. If it keeps failing, these "
+                f"tickers also work offline: {', '.join(sorted(_SEED))}."
             )
     _CACHE[key] = (now, b)
     return b
 
 
 # convenience accessors used as tools
-def quote(s): return bundle(s)["quote"]
+def quote(s):
+    """Freshest available quote. For live tickers this is the real-time spot
+    price (short-cached ~20s) with the true day move; sample tickers return their
+    bundled quote unchanged."""
+    b = bundle(s)
+    if b.get("source") == "live":
+        try:
+            return _cached_live_quote(s)
+        except Exception:
+            return b["quote"]        # live feed hiccup -> fall back to last close
+    return b["quote"]
 def price(s): return bundle(s)["price"]
 def fundamentals(s): return bundle(s)["fundamentals"]
 def news(s): return bundle(s)["news"]

@@ -60,8 +60,14 @@ price data can't be fetched, the agent keeps going with news and analysis.
 ```
 backend/
   market.py        yfinance NSE data layer: quote, price/chart, fundamentals,
-                   news, splits. Cached 5 min; falls back to data/*.json for the
-                   three sample tickers if a live fetch fails.
+                   news, splits. Bundle cached 5 min; the live spot quote has its
+                   own ~20s cache so the price stays current while markets are open.
+                   Falls back to data/*.json for the sample tickers if live fails.
+  companies.py     NSE company directory (name + ticker) behind the search-bar
+                   autocomplete (/api/symbols).
+  docstore.py      uploaded-document store: extracts text from PDF (pypdf) / Word
+                   (python-docx) / text, chunks it, and does keyword retrieval for
+                   the chat's ask_document tool. In-memory, keyed by chat thread.
   agent_task.py    the ANALYST: task-driven agent with step-by-step HITL. Proposes
                    one step, waits for Approve / Redirect / Stop, executes, repeats.
                    Grounded in real data; never invents numbers.
@@ -71,6 +77,8 @@ backend/
   app_multi.py     FastAPI. SSE endpoints:
                      /api/task/start, /api/task/step   -> Analyst (step HITL)
                      /api/chat                          -> Chat
+                     /api/symbols                       -> search autocomplete
+                     /api/upload (POST/DELETE)          -> attach/clear a document
                      /api/analyze, /api/resume          -> legacy desk
   tools.py         loads backend/.env (dotenv) + original mock tools/schemas.
   data/*.json      sample data + offline fallback.
@@ -95,7 +103,12 @@ Endpoints: `/api/task/start?ticker=&task=&thread=` then
 | get_fundamentals | PE, market cap, margins, ROE |
 | analyze_news_sentiment | pulls news, an LLM scores the mood (GenAI in a tool) |
 | get_splits | historical stock splits / corporate actions |
+| ask_document | answers from a PDF/Word doc the user uploaded to the chat (e.g. financial statements) |
 | deep_desk_analysis | runs the multi-agent Desk and returns its verdict + action |
+
+`get_quote` now returns the **live intraday price** (real-time spot via yfinance
+`fast_info`/1-min bar), today's % move vs the previous close, and the market
+state (REGULAR/CLOSED/PRE/POST) — not the last daily close.
 
 ## Run
 

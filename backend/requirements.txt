@@ -3,4 +3,18 @@ uvicorn[standard]==0.34.0
 groq==0.13.1
 pydantic==2.10.4
 python-dotenv==1.0.1
-yfinance==0.2.51
+# yfinance must stay modern: old 0.2.x builds fail Yahoo's current cookie/crumb
+# auth and return empty bodies, which look like "no data / possibly delisted" for
+# every non-cached ticker. Do NOT pin back down to 0.2.x.
+yfinance>=1.4.1
+curl_cffi>=0.7          # browser-impersonating HTTP, cuts Yahoo rate-limiting
+python-multipart==0.0.18
+pypdf==5.1.0
+python-docx==1.1.2
+
+# Agent stack (the app imports these — needed in prod, so kept here, not only in
+# requirements-langgraph.txt, so a single `pip install -r requirements.txt` on
+# Render installs everything the server needs).
+langgraph>=0.2.70,<0.3.0
+langchain-core>=0.3.29,<0.4.0
+langchain-groq>=0.2.3,<0.3.0

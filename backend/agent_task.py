@@ -149,11 +149,17 @@ def _execute(tool: str, ticker: str):
     """Returns (result_text, chart_payload_or_None). Never invents data."""
     try:
         if tool == "quote":
-            b = market.bundle(ticker)
-            q = b["quote"]
-            return (f"Latest price: ₹{q['price']} "
-                    f"({q['change_pct']:+.2f}% recent move). "
-                    f"Source: {b.get('source', 'sample')} data."), None
+            q = market.quote(ticker)
+            chg = q.get("change_pct")
+            chg_txt = f"{chg:+.2f}% today" if chg is not None else "change n/a"
+            state = q.get("market_state")
+            STATE = {"REGULAR": "market open", "CLOSED": "market closed",
+                     "PRE": "pre-market", "POST": "post-market"}
+            live = q.get("source") == "live"
+            tag = (f" [{STATE.get(state, state)}]" if state else "") if live else ""
+            asof = f" as of {q['as_of']}" if q.get("as_of") else ""
+            return (f"Latest price: ₹{q['price']} ({chg_txt}){tag}. "
+                    f"Source: {q.get('source', 'sample')} data{asof}."), None
 
         if tool == "fundamental_analysis":
             f = market.fundamentals(ticker)

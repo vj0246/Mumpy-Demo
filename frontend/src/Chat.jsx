@@ -1,8 +1,10 @@
 import { useState, useRef, useEffect } from "react";
 import Chart from "./Chart.jsx";
+import TickerSearch from "./TickerSearch.jsx";
+import { API } from "./api.js";
 
-const API = "http://localhost:8000";
 const SUGGEST = ["Do a fundamental analysis", "Why did it fall recently?", "Technical view & chart", "Bull vs bear case", "Buy, hold or sell?"];
+const DOC_SUGGEST = ["Summarise the uploaded document", "What's the net profit & revenue?", "Key risks mentioned in the document"];
 
 const TOOL_LABEL = {
   get_quote: "Quote", get_price_chart: "Chart", get_fundamentals: "Fundamentals",
@@ -13,7 +15,7 @@ const TOOL_LABEL = {
   get_splits: "Stock splits", get_dividends: "Dividends", get_52week_range: "52-week range",
   get_performance: "Performance", get_analyst_ratings: "Analyst ratings",
   get_quarterly_results: "Quarterly results", get_key_stats: "Key stats",
-  deep_desk_analysis: "Desk analysis",
+  ask_document: "Document Q&A", deep_desk_analysis: "Desk analysis",
 };
 
 export default function Chat() {
@@ -21,16 +23,47 @@ export default function Chat() {
   const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [doc, setDoc] = useState(null);        // { name, chars } of the attached document
+  const [uploading, setUploading] = useState(false);
   const esRef = useRef(null);
   const thread = useRef(crypto.randomUUID());
+  const fileRef = useRef(null);
   const bottom = useRef(null);
 
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
 
   function reset() {
     if (esRef.current) esRef.current.close();
+    if (doc) { fetch(`${API}/api/upload?thread=${thread.current}`, { method: "DELETE" }).catch(() => {}); }
     thread.current = crypto.randomUUID();   // fresh conversation memory
-    setMsgs([]); setInput(""); setBusy(false);
+    setMsgs([]); setInput(""); setBusy(false); setDoc(null);
+  }
+
+  async function onFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const fd = new FormData();
+      fd.append("thread", thread.current);
+      fd.append("file", file);
+      const r = await fetch(`${API}/api/upload`, { method: "POST", body: fd });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || "Upload failed");
+      setDoc({ name: d.name, chars: d.chars });
+      setMsgs((m) => [...m, { role: "assistant", steps: [], chart: null,
+        answer: `📄 Attached “${d.name}” (${d.chars.toLocaleString()} characters extracted). Ask me anything about it.`, loading: false }]);
+    } catch (err) {
+      setMsgs((m) => [...m, { role: "assistant", steps: [], chart: null, answer: "⚠ " + err.message, loading: false }]);
+    } finally {
+      setUploading(false);
+      if (fileRef.current) fileRef.current.value = "";   // allow re-uploading the same file
+    }
+  }
+
+  function removeDoc() {
+    fetch(`${API}/api/upload?thread=${thread.current}`, { method: "DELETE" }).catch(() => {});
+    setDoc(null);
   }
 
   function ask(text) {
@@ -72,22 +105,28 @@ export default function Chat() {
         <div className="chat-sub">Free-form Q&amp;A — it answers instantly and picks its own tools, no step-by-step approvals. (The Analyst on the left works one approved step at a time.)</div>
         <div className="chat-ticker-row">
           <span className="nse">NSE</span>
-          <input
-            className="ticker-input"
-            value={ticker}
-            onChange={(e) => setTicker(e.target.value.toUpperCase())}
-            placeholder="Stock symbol, e.g. RELIANCE"
-            spellCheck={false}
-          />
+          <TickerSearch value={ticker} onChange={setTicker} placeholder="Search company or symbol" />
+        </div>
+        <div className="chat-upload">
+          <button className="upload-btn" onClick={() => fileRef.current?.click()} disabled={uploading}>
+            {uploading ? "Uploading…" : "📎 Attach PDF / Word"}
+          </button>
+          <input ref={fileRef} type="file" accept=".pdf,.docx,.txt,.md,.csv" onChange={onFile} hidden />
+          {doc && (
+            <span className="doc-chip" title={doc.name}>
+              <span className="doc-name">📄 {doc.name}</span>
+              <button onClick={removeDoc} aria-label="Remove document" title="Remove">×</button>
+            </span>
+          )}
         </div>
       </div>
 
       <div className="chat-body">
         {msgs.length === 0 && (
           <div className="chat-empty">
-            <p>Pick a stock, ask anything.</p>
+            <p>{doc ? "Ask about the stock or your attached document." : "Pick a stock, ask anything. Or attach a PDF / Word doc above and ask about it."}</p>
             <div className="suggest">
-              {SUGGEST.map((s) => <button key={s} onClick={() => ask(s)}>{s}</button>)}
+              {(doc ? DOC_SUGGEST : SUGGEST).map((s) => <button key={s} onClick={() => ask(s)}>{s}</button>)}
             </div>
           </div>
         )}
